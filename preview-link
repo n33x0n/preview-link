@@ -60,6 +60,7 @@ server {
 
     root @ROOT@;
     autoindex off;
+    disable_symlinks on;
 
     add_header Cache-Control "no-store, no-transform" always;
     add_header X-Robots-Tag "noindex" always;
@@ -79,8 +80,12 @@ server {
         return 404;
     }
 
-    location / {
+    location ~ "^/[0-9a-f]{20}/[A-Za-z0-9][A-Za-z0-9._-]{0,120}$" {
         try_files $uri =404;
+    }
+
+    location / {
+        return 404;
     }
 }
 '''
@@ -194,11 +199,16 @@ def fetch(url, timeout=20):
         raise SystemExit(f'cannot reach {url}: {getattr(error, "reason", error)}')
 
 
-def token_of(value):
-    match = re.search(r'(?:^|/)([0-9a-f]{20})(?:/|$)', value)
-    if not match:
-        raise SystemExit(f'no preview token in {value!r}')
-    return match.group(1)
+def token_of(value, base, root, allow_token=False):
+    if allow_token and TOKEN.fullmatch(value):
+        return value
+    prefix = base + '/' if base else None
+    if prefix and value.startswith(prefix):
+        parts = value[len(prefix):].split('/')
+        if (len(parts) == 2 and TOKEN.fullmatch(parts[0]) and NAME.fullmatch(parts[1])
+                and (root / parts[0] / parts[1]).is_file()):
+            return parts[0]
+    raise SystemExit('link must name an existing preview under the configured base URL')
 
 
 # ---------------------------------------------------------------- put, check, rm, ls
@@ -209,7 +219,7 @@ def put(args):
     if not source.is_file():
         raise SystemExit(f'{source} is not a file')
     if args.over:
-        token = token_of(args.over)
+        token = token_of(args.over, base, root)
         name = args.over.rstrip('/').rsplit('/', 1)[-1]
         if args.name and args.name != name:
             raise SystemExit(f'--name {args.name!r} differs from the name in the link, {name!r}')
@@ -254,7 +264,7 @@ def check(args):
 
 def rm(args):
     root, base = settings(need_url=not args.no_check)
-    token = token_of(args.target)
+    token = token_of(args.target, base, root, allow_token=True)
     folder = root / token
     if not folder.is_dir():
         raise SystemExit(f'no preview {token} on disk')

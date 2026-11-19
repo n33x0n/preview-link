@@ -613,6 +613,21 @@ http {{
         token = link.split('/')[-2]
         self.assertEqual(mode_of(self.www / token), 0o755, 'a strict umask must not hide the folder')
         self.assertEqual(mode_of(self.www / token / 'page.html'), 0o644)
+        (self.www / 'unrelated.txt').write_text('private')
+        self.assertEqual(self.get('/unrelated.txt')[0], 404)
+        (self.www / token / 'linked.txt').symlink_to(self.www / 'unrelated.txt')
+        self.assertNotEqual(self.get(f'/{token}/linked.txt')[0], 200)
+        (self.www / token / 'linked.txt').unlink()
+
+        foreign = f'http://foreign.test/{token}/page.html'
+        for target in (foreign, f'http://preview.test:{self.port}/{token}/missing.html'):
+            denied = cli(['rm', target, '--no-check'], self.env())
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertTrue((self.www / token / 'page.html').is_file())
+        denied = cli(['put', source, '--over', foreign], self.env())
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertEqual((self.www / token / 'page.html').read_text(), '<p>first</p>\n')
+        (self.www / 'unrelated.txt').unlink()
 
         done = cli(['check', link], self.env())
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -716,8 +731,7 @@ http {{
         self.assertFalse(self.vhost().exists())
         self.assertTrue((self.www / token / 'keep.txt').is_file(), 'published files stay without --purge')
         self.assertFalse((self.tmp / 'config.json').exists())
-        self.assertTrue(wait_for(lambda: not self.serving()))
-        self.assertEqual(self.get('/robots.txt')[2], b'default server\n')
+        self.assertTrue(wait_for(lambda: self.get('/robots.txt')[2] == b'default server\n'))
 
         done = cli(self.init_args() + ['--apply'], self.env())
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)

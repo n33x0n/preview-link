@@ -8,7 +8,7 @@ It is one Python 3 script with no dependencies beyond the standard library.
 
 - `put FILE` copies a file to `<root>/<20-hex-token>/<file>` and prints the public link. `put --over LINK` replaces the file and keeps the link.
 - `check LINK` prints the HTTP status and content type, and warns on stderr when a response header is missing.
-- `rm LINK` deletes the file, then requests the link again and reports whether it returns 404. It exits non-zero if it does not.
+- `rm LINK` deletes the file only if the link belongs to the configured base URL and names an existing preview. A bare token deletes its preview directory. It then requests each removed link and reports whether it returns 404.
 - `ls` lists what is still public.
 - `init --host HOST` sets up an nginx vhost for the preview root. It prints a dry-run plan by default and writes only with `--apply`.
 - `init --undo HOST` removes the vhost that `init` wrote.
@@ -17,7 +17,7 @@ It is one Python 3 script with no dependencies beyond the standard library.
 - Every action goes to a JSON-lines log.
 - The vhost sends `Cache-Control: no-store, no-transform`, `X-Robots-Tag: noindex` and `X-Content-Type-Options: nosniff` on every response, serves only GET and HEAD, and lists no directory.
 
-The token is not authentication. Anyone who has the link can read the file. Files do not expire automatically.
+The token is not authentication. Anyone who has the link can read the file. Files do not expire automatically. Use a dedicated preview root: matching token paths under it are public.
 
 ## Install
 
@@ -66,7 +66,7 @@ preview-link ls
 preview-link rm <link>                    # deleted, now 404
 ```
 
-`put --name NAME` publishes under another file name. Names use letters, digits, dot, dash and underscore, and start with a letter or digit.
+`put --name NAME` publishes under another file name. Names use letters, digits, dot, dash and underscore, and start with a letter or digit. `put --over LINK` accepts only a link under the configured base URL.
 
 ### `init` flags
 
