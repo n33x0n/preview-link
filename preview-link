@@ -1,0 +1,1178 @@
+#!/usr/bin/env python3
+"""Short-lived public files behind an unguessable URL, served by nginx.
+
+  preview-link init --host HOST [--apply]   set up an nginx vhost (dry run unless --apply)
+  preview-link init --undo HOST [--apply]   remove the vhost that init wrote
+  preview-link doctor                       check the vhost and do a real round trip
+  preview-link put FILE [--name NAME]       publish one file, print its link
+  preview-link put FILE --over LINK         upload over an existing preview, same link
+  preview-link check LINK                   print the status and type the link serves
+  preview-link rm LINK|TOKEN                delete it and confirm the link returns 404
+  preview-link ls                           list what is still public
+
+Files live in <root>/<token>/<name>. nginx serves them as <base-url>/<token>/<name> with
+Cache-Control: no-store. The token is random, so nothing is listed or guessable. The token is
+not authentication: anyone who has the link can read the file.
+"""
+
+import argparse
+import fnmatch
+import glob
+import hashlib
+import http.client
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+MARKER = '# managed by preview-link'
+DEFAULT_ROOT = '/var/www/preview-link'
+TOKEN = re.compile(r'^[0-9a-f]{20}$')
+NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,120}')
+HOST = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?')
+SAFE_PATH = re.compile(r'/[A-Za-z0-9._/+@-]*')
+LISTEN = re.compile(r'(?:(\d{1,3}(?:\.\d{1,3}){3}):)?(\d{1,5})')
+DEFAULT_EXTRA_PATH = '/usr/sbin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/bin:/sbin'
+
+RESPONSE_HEADERS = (
+    ('Cache-Control', 'no-store, no-transform'),
+    ('X-Robots-Tag', 'noindex'),
+    ('X-Content-Type-Options', 'nosniff'),
+)
+
+VHOST = '''# managed by preview-link
+# Public preview files. Written by `preview-link init`.
+# Remove it with `preview-link init --undo @HOST@`. TLS mode: @TLS@.
+server {
+    listen @LISTEN@;
+    server_name @HOST@;
+    server_tokens off;
+
+    root @ROOT@;
+    autoindex off;
+
+    add_header Cache-Control "no-store, no-transform" always;
+    add_header X-Robots-Tag "noindex" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    if ($request_method !~ ^(GET|HEAD)$) {
+        return 405;
+    }
+
+    location = /robots.txt {
+        default_type text/plain;
+        return 200 "User-agent: *\\nDisallow: /\\n";
+    }
+
+    # Dotfiles, and every path that ends in a slash (directory views).
+    location ~ (/\\.|/$) {
+        return 404;
+    }
+
+    location / {
+        try_files $uri =404;
+    }
+}
+'''
+
+INSTALL = {
+    'apt-get': [['apt-get', 'update'], ['apt-get', 'install', '-y', 'nginx']],
+    'dnf': [['dnf', 'install', '-y', 'nginx']],
+    'yum': [['yum', 'install', '-y', 'nginx']],
+    'apk': [['apk', 'add', 'nginx']],
+    'pacman': [['pacman', '-S', '--noconfirm', 'nginx']],
+    'zypper': [['zypper', '--non-interactive', 'install', 'nginx']],
+    'brew': [['brew', 'install', 'nginx']],
+}
+ALL_MANAGERS = ('apt-get', 'dnf', 'yum', 'apk', 'pacman', 'zypper', 'brew')
+FAMILY_MANAGERS = {
+    'debian': ('apt-get',), 'redhat': ('dnf', 'yum'), 'alpine': ('apk',),
+    'arch': ('pacman',), 'suse': ('zypper',), 'macos': ('brew',),
+}
+FAMILY_IDS = {
+    'debian': 'debian', 'ubuntu': 'debian', 'raspbian': 'debian', 'linuxmint': 'debian',
+    'fedora': 'redhat', 'rhel': 'redhat', 'centos': 'redhat', 'rocky': 'redhat',
+    'almalinux': 'redhat', 'amzn': 'redhat', 'ol': 'redhat',
+    'alpine': 'alpine', 'arch': 'arch', 'manjaro': 'arch',
+    'suse': 'suse', 'opensuse': 'suse', 'opensuse-leap': 'suse', 'opensuse-tumbleweed': 'suse', 'sles': 'suse',
+}
+
+
+class Stop(Exception):
+    """A plan that cannot go on. The message tells the user what to do."""
+
+
+# ---------------------------------------------------------------- settings and log
+
+def config_path():
+    explicit = os.environ.get('PREVIEW_LINK_CONFIG')
+    if explicit:
+        return Path(explicit)
+    base = os.environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')
+    return Path(base) / 'preview-link' / 'config.json'
+
+
+def load_config():
+    path = config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot read {path}: {error}')
+    if not isinstance(data, dict):
+        raise SystemExit(f'{path} is not a JSON object')
+    return data
+
+
+def settings(need_url=True):
+    config = load_config()
+    root = os.environ.get('PREVIEW_LINK_ROOT') or config.get('root')
+    url = os.environ.get('PREVIEW_LINK_URL') or config.get('base_url')
+    if not root or (need_url and not url):
+        raise SystemExit(
+            'preview-link is not configured. Run `preview-link init --host HOST` to set up nginx '
+            'and write the config file, or set PREVIEW_LINK_ROOT and PREVIEW_LINK_URL.')
+    return Path(root), (url or '').rstrip('/')
+
+
+def log_path():
+    explicit = os.environ.get('PREVIEW_LINK_LOG')
+    if explicit:
+        return Path(explicit)
+    base = os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')
+    return Path(base) / 'preview-link' / 'log.jsonl'
+
+
+def log(entry):
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a') as out:
+        out.write(json.dumps({'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **entry}) + '\n')
+
+
+# ---------------------------------------------------------------- HTTP
+
+def raw_request(connect_host, connect_port, host_header, method, path, timeout=10):
+    conn = http.client.HTTPConnection(connect_host, connect_port, timeout=timeout)
+    try:
+        conn.request(method, path, headers={'Host': host_header, 'User-Agent': 'preview-link'})
+        response = conn.getresponse()
+        body = response.read()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}, body
+    finally:
+        conn.close()
+
+
+def fetch(url, timeout=20):
+    """GET url. PREVIEW_LINK_CONNECT=HOST:PORT sends http links to that address instead."""
+    connect = os.environ.get('PREVIEW_LINK_CONNECT')
+    parts = urlsplit(url)
+    if connect and parts.scheme == 'http':
+        host, _, port = connect.rpartition(':')
+        if not host or not port.isdigit():
+            raise SystemExit('PREVIEW_LINK_CONNECT must look like HOST:PORT')
+        path = (parts.path or '/') + (f'?{parts.query}' if parts.query else '')
+        return raw_request(host, int(port), parts.netloc, 'GET', path, timeout)
+    request = urllib.request.Request(url, method='GET', headers={'User-Agent': 'preview-link'})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, b''
+    except urllib.error.HTTPError as error:
+        return error.code, {k.lower(): v for k, v in error.headers.items()}, b''
+    except (urllib.error.URLError, OSError) as error:
+        raise SystemExit(f'cannot reach {url}: {getattr(error, "reason", error)}')
+
+
+def token_of(value):
+    match = re.search(r'(?:^|/)([0-9a-f]{20})(?:/|$)', value)
+    if not match:
+        raise SystemExit(f'no preview token in {value!r}')
+    return match.group(1)
+
+
+# ---------------------------------------------------------------- put, check, rm, ls
+
+def put(args):
+    root, base = settings()
+    source = Path(args.file)
+    if not source.is_file():
+        raise SystemExit(f'{source} is not a file')
+    if args.over:
+        token = token_of(args.over)
+        name = args.over.rstrip('/').rsplit('/', 1)[-1]
+        if args.name and args.name != name:
+            raise SystemExit(f'--name {args.name!r} differs from the name in the link, {name!r}')
+    else:
+        token = secrets.token_hex(10)
+        name = args.name or source.name
+    if not NAME.fullmatch(name):
+        raise SystemExit(f'name {name!r}: use letters, digits, dot, dash, underscore')
+    if not root.is_dir():
+        raise SystemExit(f'root {root} is not a directory. Run `preview-link init` or fix the config.')
+    folder = root / token
+    target = folder / name
+    if args.over:
+        if not target.is_file():
+            raise SystemExit(f'no preview at {args.over}')
+    else:
+        folder.mkdir()
+        folder.chmod(0o755)
+    partial = folder / f'.{name}.part'
+    shutil.copyfile(source, partial)
+    partial.chmod(0o644)
+    os.replace(partial, target)
+    link = f'{base}/{token}/{name}'
+    digest = hashlib.sha256()
+    with target.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(chunk)
+    log({'action': 'replace' if args.over else 'put', 'link': link, 'source': str(source.resolve()),
+         'bytes': target.stat().st_size, 'sha256': digest.hexdigest()})
+    print(link)
+
+
+def check(args):
+    status, headers, _ = fetch(args.link)
+    print(f'{status}\t{headers.get("content-type", "")}')
+    if status == 200:
+        for name, want in RESPONSE_HEADERS:
+            if want not in headers.get(name.lower(), ''):
+                print(f'warning: {name} is {headers.get(name.lower(), "missing")!r}, expected {want!r}', file=sys.stderr)
+    sys.exit(0 if status == 200 else 1)
+
+
+def rm(args):
+    root, base = settings(need_url=not args.no_check)
+    token = token_of(args.target)
+    folder = root / token
+    if not folder.is_dir():
+        raise SystemExit(f'no preview {token} on disk')
+    links = [f'{base}/{token}/{child.name}' for child in folder.iterdir() if not child.name.startswith('.')]
+    shutil.rmtree(folder)
+    failed = False
+    for link in links:
+        status = None if args.no_check else fetch(link)[0]
+        log({'action': 'rm', 'link': link, 'status_after': status})
+        print(f'{link} deleted, now {status if status is not None else "not checked"}')
+        failed = failed or (status is not None and status != 404)
+    if failed:
+        sys.exit(1)
+
+
+def ls(_args):
+    root, base = settings()
+    if not root.is_dir():
+        return
+    for folder in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime):
+        if folder.is_dir() and TOKEN.match(folder.name):
+            age = (time.time() - folder.stat().st_mtime) / 3600
+            for child in folder.iterdir():
+                if not child.name.startswith('.'):
+                    print(f'{base}/{folder.name}/{child.name}\t{child.stat().st_size} B\t{age:.1f} h')
+
+
+# ---------------------------------------------------------------- environment detection
+
+def search_path():
+    parts = os.environ.get('PATH', '').split(os.pathsep)
+    parts += os.environ.get('PREVIEW_LINK_EXTRA_PATH', DEFAULT_EXTRA_PATH).split(os.pathsep)
+    return os.pathsep.join(p for p in parts if p)
+
+
+def find_exe(name):
+    return shutil.which(name, path=search_path())
+
+
+def run(cmd, timeout=120):
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return SimpleNamespace(rc=124, out='', err='timed out')
+    except OSError as error:
+        return SimpleNamespace(rc=127, out='', err=str(error))
+    return SimpleNamespace(rc=done.returncode, out=done.stdout, err=done.stderr)
+
+
+def text_of(result):
+    return (result.err + result.out).strip()
+
+
+def read_os_release():
+    path = os.environ.get('PREVIEW_LINK_OS_RELEASE', '/etc/os-release')
+    data = {}
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return data
+    for line in text.splitlines():
+        match = re.match(r'([A-Z_]+)=(.*)', line.strip())
+        if match:
+            data[match.group(1)] = match.group(2).strip().strip('"\'')
+    return data
+
+
+def detect_os():
+    release = read_os_release()
+    if sys.platform == 'darwin' and 'PREVIEW_LINK_OS_RELEASE' not in os.environ:
+        name, family = 'macOS', 'macos'
+    else:
+        ids = [release.get('ID', '')] + release.get('ID_LIKE', '').split()
+        family = next((FAMILY_IDS[i] for i in ids if i in FAMILY_IDS), None)
+        name = release.get('PRETTY_NAME') or release.get('ID') or sys.platform
+    manager = next((m for m in FAMILY_MANAGERS.get(family, ()) + ALL_MANAGERS if find_exe(m)), None)
+    return SimpleNamespace(name=name, family=family, manager=manager)
+
+
+def segment_match(pattern, path):
+    pattern_parts, path_parts = pattern.split('/'), path.split('/')
+    return len(pattern_parts) == len(path_parts) and all(
+        fnmatch.fnmatchcase(q, p) for p, q in zip(pattern_parts, path_parts))
+
+
+# nginx configuration: a small tokenizer and tree, enough to follow include lines and
+# find the user, server_name and listen directives.
+
+class Node:
+    __slots__ = ('name', 'args', 'children', 'file')
+
+    def __init__(self, name, args, children, file):
+        self.name, self.args, self.children, self.file = name, args, children, file
+
+
+def tokenize(text):
+    tokens, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c == '#':
+            while i < n and text[i] != '\n':
+                i += 1
+        elif c in '{};':
+            tokens.append(('p', c))
+            i += 1
+        elif c in '"\'':
+            j, word = i + 1, ''
+            while j < n and text[j] != c:
+                if text[j] == '\\' and j + 1 < n:
+                    j += 1
+                word += text[j]
+                j += 1
+            tokens.append(('w', word))
+            i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in ';{}':
+                if text[j] == '$' and j + 1 < n and text[j + 1] == '{':
+                    j = text.find('}', j)
+                    j = n if j < 0 else j
+                j += 1
+            tokens.append(('w', text[i:j]))
+            i = max(j, i + 1)
+    return tokens
+
+
+def parse_nginx(text, path):
+    root = []
+    stack, words = [root], []
+    for kind, value in tokenize(text):
+        if kind == 'w':
+            words.append(value)
+        elif value == ';':
+            if words:
+                stack[-1].append(Node(words[0], words[1:], [], path))
+            words = []
+        elif value == '{':
+            node = Node(words[0] if words else '', words[1:], [], path)
+            stack[-1].append(node)
+            stack.append(node.children)
+            words = []
+        elif len(stack) > 1:
+            stack.pop()
+            words = []
+    return root
+
+
+class NginxConfig:
+    """What nginx loads: the file texts, the include lines with their context, the merged tree."""
+
+    def __init__(self, main, read, resolve):
+        self.main = main
+        self.prefix = os.path.dirname(main)
+        self.includes = []
+        self.tree = self._walk(parse_nginx(read(main), main), (), 0, {main}, read, resolve)
+
+    def _walk(self, nodes, context, depth, seen, read, resolve):
+        out = []
+        for node in nodes:
+            if node.name == 'include' and node.args and not node.children:
+                pattern = os.path.normpath(os.path.join(self.prefix, node.args[0]))
+                self.includes.append((pattern, context))
+                if depth < 10:
+                    for path in resolve(pattern):
+                        if path not in seen:
+                            try:
+                                text = read(path)
+                            except OSError:
+                                continue
+                            out.extend(self._walk(parse_nginx(text, path), context, depth + 1, seen | {path}, read, resolve))
+            else:
+                children = self._walk(node.children, context + (node.name,), depth, seen, read, resolve)
+                out.append(Node(node.name, node.args, children, node.file))
+        return out
+
+    def includes_in_http(self, path):
+        """True when an include line in the http block matches path."""
+        path = os.path.normpath(path)
+        return any(ctx == ('http',) and segment_match(pattern, path) for pattern, ctx in self.includes)
+
+    def worker_user(self):
+        for node in self.tree:
+            if node.name == 'user' and node.args:
+                return node.args[0]
+        return None
+
+    def servers(self):
+        return [s for http in self.tree if http.name == 'http' for s in http.children if s.name == 'server']
+
+
+def server_ports(server):
+    ports = set()
+    for child in server.children:
+        if child.name == 'listen' and child.args:
+            match = re.fullmatch(r'(?:.*:)?(\d+)', child.args[0])
+            ports.add(int(match.group(1)) if match else 80)
+    return ports or {80}
+
+
+def inspect_nginx(binary):
+    """Run nginx -v, then nginx -T. If -T fails, read the config from disk using nginx -V."""
+    version_run = run([binary, '-v'])
+    found = re.search(r'nginx/([^\s)]+)', text_of(version_run))
+    info = SimpleNamespace(binary=binary, version=found.group(1) if found else 'unknown',
+                           config=None, source='', error='')
+    dump = run([binary, '-T'])
+    parts = re.split(r'^# configuration file (.+):\n', dump.out, flags=re.M) if dump.rc == 0 else []
+    if len(parts) >= 3:
+        files = {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
+        main = parts[1]
+        info.config = NginxConfig(
+            main, lambda p: files[p],
+            lambda pattern: sorted(f for f in files if segment_match(pattern, f)))
+        info.source = f'nginx -T ({main})'
+        return info
+    reason = text_of(dump).splitlines()[-1] if text_of(dump) else f'exit {dump.rc}'
+    flags = text_of(run([binary, '-V']))
+    conf = re.search(r'--conf-path=(\S+)', flags)
+    prefix = re.search(r'--prefix=(\S+)', flags)
+    main = conf.group(1) if conf else (os.path.join(prefix.group(1), 'conf/nginx.conf') if prefix else '')
+    if not main or not os.path.isfile(main):
+        info.error = (f'nginx -T failed ({reason}) and the main config file '
+                      f'{main or "(unknown)"} cannot be read from nginx -V output.')
+        return info
+    info.config = NginxConfig(
+        main, lambda p: Path(p).read_text(errors='replace'),
+        lambda pattern: sorted(f for f in glob.glob(pattern) if os.path.isfile(f)))
+    info.source = f'nginx -V and {main} read from disk (nginx -T failed: {reason})'
+    return info
+
+
+def layout_for_dir(conf_dir, filename):
+    """Debian style when conf_dir is sites-enabled next to sites-available, else one file in conf_dir."""
+    conf_dir = Path(conf_dir)
+    available = conf_dir.parent / 'sites-available'
+    if conf_dir.name == 'sites-enabled' and available.is_dir():
+        return SimpleNamespace(file=available / filename, link=conf_dir / filename, dir=conf_dir,
+                               style='sites-available + sites-enabled symlink')
+    labels = {'conf.d': 'conf.d include', 'servers': 'servers include (Homebrew style)'}
+    return SimpleNamespace(file=conf_dir / filename, link=None, dir=conf_dir,
+                           style=labels.get(conf_dir.name, 'custom directory'))
+
+
+def choose_layout(info, host, conf_dir_arg):
+    filename = f'preview-link-{host}.conf'
+    config = info.config
+    if conf_dir_arg:
+        candidates = [Path(os.path.abspath(conf_dir_arg))]
+    else:
+        prefix = Path(config.prefix)
+        candidates = [d for d in (prefix / 'sites-enabled', prefix / 'conf.d', prefix / 'servers')
+                      if d.is_dir() and (d.name != 'sites-enabled' or (prefix / 'sites-available').is_dir())]
+    for directory in candidates:
+        layout = layout_for_dir(directory, filename)
+        if config.includes_in_http(str(layout.link or layout.file)):
+            layout.proof = f'an include line in the http block of {config.main} matches {layout.link or layout.file}'
+            return layout
+    suggest = Path(os.path.abspath(conf_dir_arg)) if conf_dir_arg else Path(config.prefix) / 'conf.d'
+    raise Stop(
+        f'cannot prove that nginx includes {suggest}/ in its http block.\n'
+        f'preview-link never edits nginx.conf. Add this line inside the http {{ }} block of {config.main}:\n\n'
+        f'    include {suggest}/*.conf;\n\n'
+        'Then run init again. If nginx already includes another directory, pass it with --nginx-conf-dir.')
+
+
+# ---------------------------------------------------------------- file helpers
+
+def is_marked(text):
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip() == MARKER
+    return False
+
+
+def snapshot(path):
+    path = Path(path)
+    if path.is_symlink():
+        return ('link', os.readlink(path))
+    if path.is_file():
+        return ('file', path.read_bytes(), path.stat().st_mode & 0o777)
+    return None
+
+
+def atomic_write(path, data, mode=0o644):
+    path = Path(path)
+    tmp = path.with_name(f'.{path.name}.tmp{os.getpid()}')
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def atomic_symlink(link, target):
+    link = Path(link)
+    tmp = link.with_name(f'.{link.name}.tmp{os.getpid()}')
+    try:
+        os.symlink(target, tmp)
+        os.replace(tmp, link)
+    finally:
+        if tmp.is_symlink():
+            tmp.unlink()
+
+
+def restore(path, snap):
+    path = Path(path)
+    if snap is None:
+        if path.is_symlink() or path.exists():
+            path.unlink()
+    elif snap[0] == 'link':
+        atomic_symlink(path, snap[1])
+    else:
+        atomic_write(path, snap[1], snap[2])
+
+
+def make_dirs(path):
+    """Create missing directories, each with mode 0755 whatever the umask. Return what was created."""
+    missing, current = [], Path(path)
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    created = []
+    for directory in reversed(missing):
+        directory.mkdir()
+        directory.chmod(0o755)
+        created.append(directory)
+    return created
+
+
+def writable_path(path):
+    current = Path(path)
+    while not os.path.lexists(current):
+        current = current.parent
+    return os.access(current, os.W_OK | os.X_OK)
+
+
+def unreachable_dirs(path):
+    blocked, current = [], Path('/')
+    for part in Path(path).parts[1:]:
+        current = current / part
+        if current.exists() and not current.stat().st_mode & 0o001:
+            blocked.append(str(current))
+    return blocked
+
+
+def write_config_file(values):
+    path = config_path()
+    make_dirs(path.parent)
+    atomic_write(path, (json.dumps(values, indent=2) + '\n').encode())
+    return path
+
+
+# ---------------------------------------------------------------- init
+
+def parse_listen(value):
+    match = LISTEN.fullmatch(str(value))
+    if not match or not 1 <= int(match.group(2)) <= 65535:
+        raise SystemExit(f'--listen {value!r}: use PORT or ADDRESS:PORT, for example 80 or 127.0.0.1:8080')
+    return match.group(1), int(match.group(2))
+
+
+def check_host(value):
+    host = value.lower()
+    if not HOST.fullmatch(host) or '..' in host:
+        raise SystemExit(f'--host {value!r}: use a plain host name, for example preview.example.org')
+    return host
+
+
+def check_dir(value, flag):
+    path = os.path.abspath(os.path.expanduser(value))
+    if path == '/' or not SAFE_PATH.fullmatch(path):
+        raise SystemExit(f'{flag} {value!r}: use an absolute path with letters, digits and . _ / + @ - only')
+    return path
+
+
+def default_base_url(tls, host, port):
+    if tls == 'none':
+        return f'http://{host}' + ('' if port == 80 else f':{port}')
+    return f'https://{host}'
+
+
+def render_vhost(host, listen, root, tls):
+    return (VHOST.replace('@HOST@', host).replace('@LISTEN@', listen)
+            .replace('@ROOT@', root).replace('@TLS@', tls))
+
+
+def pick_reload(binary, explicit):
+    if not explicit and find_exe('systemctl') and run(['systemctl', 'is-active', '--quiet', 'nginx']).rc == 0:
+        return ['systemctl', 'reload', 'nginx']
+    return [binary, '-s', 'reload']
+
+
+def show(cmd):
+    return shlex.join(str(c) for c in cmd)
+
+
+def print_environment(osinfo, binary, info):
+    print('Environment')
+    print(f'  system:          {osinfo.name} (family: {osinfo.family or "unknown"})')
+    print(f'  package manager: {osinfo.manager or "none found"}')
+    print(f'  running as:      uid {os.geteuid()}{" (root)" if os.geteuid() == 0 else " (not root)"}')
+    if binary:
+        print(f'  nginx:           {binary}, version {info.version if info else "unknown"}')
+    else:
+        print('  nginx:           not found')
+    if info and info.config:
+        print(f'  config source:   {info.source}')
+        print(f'  worker user:     {info.config.worker_user() or "not set in the config (nginx default)"}')
+
+
+def install_message(osinfo):
+    cmds = INSTALL.get(osinfo.manager)
+    if not cmds:
+        return ('nginx is not installed and no supported package manager was found '
+                f'(looked for {", ".join(ALL_MANAGERS)}). Install nginx by hand, then run init again.')
+    lines = ['nginx is not installed. To install it, run as root:', '']
+    lines += [f'    {show(c)}' for c in cmds]
+    lines += ['', 'Then run init again. Or add --install-nginx --apply and run init as root.']
+    return '\n'.join(lines)
+
+
+def install_nginx(osinfo):
+    if osinfo.manager == 'brew':
+        raise Stop('Homebrew refuses to run as root. Run `brew install nginx` as your normal user, then run init again.')
+    if not INSTALL.get(osinfo.manager):
+        raise Stop(install_message(osinfo))
+    if os.geteuid() != 0:
+        raise Stop('step "install nginx" needs root. Run init as root (preview-link never calls sudo), '
+                   f'or install nginx yourself with: {show(INSTALL[osinfo.manager][-1])}')
+    for cmd in INSTALL[osinfo.manager]:
+        print(f'running: {show(cmd)}')
+        if subprocess.run(cmd).returncode != 0:
+            raise Stop(f'`{show(cmd)}` failed. Fix that, then run init again.')
+
+
+def init(args):
+    if args.undo:
+        return undo(args)
+    if not args.host:
+        raise SystemExit('init needs --host HOST (or --undo HOST)')
+    host = check_host(args.host)
+    root = check_dir(args.root or DEFAULT_ROOT, '--root')
+    addr, port = parse_listen(args.listen)
+    listen = f'{addr}:{port}' if addr else str(port)
+    base_url = (args.base_url or default_base_url(args.tls, host, port)).rstrip('/')
+    if not re.fullmatch(r'https?://[^\s]+', base_url):
+        raise SystemExit(f'--base-url {args.base_url!r}: use http:// or https:// followed by a host')
+    apply = args.apply
+    print(f'preview-link init: {"APPLY" if apply else "DRY RUN (nothing is changed; add --apply to write)"}')
+    print()
+
+    osinfo = detect_os()
+    explicit_bin = args.nginx_bin
+    if explicit_bin and not (os.path.isfile(explicit_bin) and os.access(explicit_bin, os.X_OK)):
+        raise SystemExit(f'--nginx-bin {explicit_bin!r} is not an executable file')
+    binary = explicit_bin or find_exe('nginx')
+    try:
+        if not binary:
+            print_environment(osinfo, None, None)
+            print()
+            if not args.install_nginx:
+                print(install_message(osinfo))
+                return 1
+            if not apply:
+                cmds = INSTALL.get(osinfo.manager)
+                if not cmds:
+                    print(install_message(osinfo))
+                    return 1
+                print('Plan: install nginx with')
+                for cmd in cmds:
+                    print(f'    {show(cmd)}')
+                print('\nThis needs root and --apply. Run the dry run again after the install to see the vhost plan.')
+                return 0
+            install_nginx(osinfo)
+            binary = find_exe('nginx')
+            if not binary:
+                raise Stop('nginx was installed but is still not found on PATH or in the usual sbin directories. '
+                           'Pass --nginx-bin PATH.')
+        info = inspect_nginx(binary)
+        print_environment(osinfo, binary, info)
+        if info.error:
+            raise Stop(info.error)
+        layout = choose_layout(info, host, args.nginx_conf_dir)
+        return plan_and_apply(args, info, layout, host, root, listen, port, base_url)
+    except Stop as stop:
+        print(stop, file=sys.stderr)
+        return 1
+
+
+def plan_and_apply(args, info, layout, host, root, listen, port, base_url):
+    config = info.config
+    apply = args.apply
+    euid = os.geteuid()
+    filename = layout.file.name
+    text = render_vhost(host, listen, root, args.tls)
+    print(f'  vhost loading:   {layout.style}')
+    print(f'  proof:           {layout.proof}')
+
+    problems = []
+    existing = snapshot(layout.file)
+    if existing and not args.force:
+        marked = layout.file.exists() and is_marked(layout.file.read_text(errors='replace'))
+        if not marked:
+            problems.append(f'refusing to overwrite {layout.file}: it was not written by preview-link. Use --force to replace it.')
+    if layout.link and os.path.lexists(layout.link) and not args.force:
+        if not (layout.link.is_symlink() and os.path.realpath(layout.link) == os.path.realpath(layout.file)):
+            problems.append(f'refusing to replace {layout.link}: it is not a symlink to {layout.file}. Use --force to replace it.')
+    if os.path.lexists(root) and not os.path.isdir(root):
+        problems.append(f'{root} exists and is not a directory.')
+    clashes = []
+    for server in config.servers():
+        if os.path.basename(server.file) == filename:
+            continue
+        names = [a for n in server.children if n.name == 'server_name' for a in n.args]
+        if host in names and int(port) in server_ports(server):
+            clashes.append(server.file)
+
+    needs_root = []
+    steps = []
+
+    def add_step(text, path):
+        """Add a plan step that writes under path. Mark it when this user cannot write there."""
+        if euid != 0 and not writable_path(path):
+            steps.append(f'{text} [needs root: {path} is not writable by uid {euid}]')
+            needs_root.append(text)
+        else:
+            steps.append(text)
+
+    root_exists = os.path.isdir(root)
+    if root_exists:
+        steps.append(f'root directory {root} exists; leave it as it is')
+    else:
+        add_step(f'create root directory {root} (mode 0755)', root)
+    add_step(f'write {layout.file} (mode 0644, atomic)', layout.file.parent)
+    if layout.link:
+        add_step(f'symlink {layout.link} -> {layout.file}', layout.link.parent)
+    test_cmd = [info.binary, '-t']
+    reload_cmd = pick_reload(info.binary, bool(args.nginx_bin))
+    steps.append(f'run {show(test_cmd)}; on failure remove or restore what was written and stop')
+    steps.append(f'write config file {config_path()}')
+    steps.append('reload nginx: skipped (--no-reload)' if args.no_reload else f'reload nginx: {show(reload_cmd)}')
+
+    print()
+    print('Plan')
+    for number, step in enumerate(steps, 1):
+        print(f'  {number}. {step}')
+    print(f'  link prefix: {base_url}/<token>/<file>')
+    for warning in ([f'another server block names {host} on port {port} in {f}; nginx may ignore this vhost' for f in clashes]
+                    + [f'nginx may not reach {root}: {d} is not searchable by other users' for d in unreachable_dirs(root)]):
+        print(f'  warning: {warning}')
+    print(f'  note: the root directory belongs to the user who creates it. Publish as that user, '
+          f'or give another user write access: chown USER {root}')
+    print()
+    print('Vhost file')
+    print('  ' + text.rstrip().replace('\n', '\n  '))
+    print()
+    print('Equivalent commands')
+    if not root_exists:
+        print(f'  mkdir -m 0755 -p {root}')
+    print(f'  install -m 0644 <vhost text> {layout.file}')
+    if layout.link:
+        print(f'  ln -sf {layout.file} {layout.link}')
+    print(f'  {show(test_cmd)}')
+    if not args.no_reload:
+        print(f'  {show(reload_cmd)}')
+    values = {'host': host, 'root': root, 'base_url': base_url, 'listen': listen, 'tls': args.tls,
+              'vhost': str(layout.file), 'enabled_link': str(layout.link) if layout.link else None,
+              'nginx_bin': info.binary}
+    print()
+    print(f'Config file {config_path()}')
+    print('  ' + json.dumps(values, indent=2).replace('\n', '\n  '))
+    print()
+    print_next(args.tls, host)
+
+    if problems:
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 1
+    if not apply:
+        return 0
+    if needs_root and euid != 0:
+        for item in needs_root:
+            print(f'step "{item}" needs root. Re-run init as root (preview-link never calls sudo). Nothing was changed.',
+                  file=sys.stderr)
+        return 1
+
+    created, snap_file = [], existing
+    snap_link = snapshot(layout.link) if layout.link else None
+    print('Applying')
+    try:
+        created += make_dirs(root)
+        created += make_dirs(layout.file.parent)
+        atomic_write(layout.file, text.encode())
+        print(f'  wrote {layout.file}')
+        if layout.link:
+            atomic_symlink(layout.link, layout.file)
+            print(f'  linked {layout.link}')
+    except OSError as error:
+        rollback(layout, snap_file, snap_link, created)
+        print(f'init failed: {error}. Everything it wrote was removed.', file=sys.stderr)
+        return 1
+    tested = run(test_cmd)
+    if tested.rc != 0:
+        rollback(layout, snap_file, snap_link, created)
+        print(f'{show(test_cmd)} failed. Everything init wrote was removed or restored. nginx said:', file=sys.stderr)
+        print(text_of(tested), file=sys.stderr)
+        return 1
+    print(f'  {show(test_cmd)}: ok')
+    try:
+        path = write_config_file(values)
+        print(f'  wrote {path}')
+    except OSError as error:
+        print(f'cannot write the config file: {error}. The vhost is in place; set PREVIEW_LINK_ROOT and '
+              'PREVIEW_LINK_URL instead.', file=sys.stderr)
+        return 1
+    log({'action': 'init', 'host': host, 'vhost': str(layout.file), 'root': root})
+    if args.no_reload:
+        print('  nginx not reloaded (--no-reload). Reload it before you publish.')
+    else:
+        reloaded = run(reload_cmd)
+        if reloaded.rc != 0:
+            print(f'{show(reload_cmd)} failed: {text_of(reloaded)}', file=sys.stderr)
+            print('The vhost is written and nginx -t passed. Reload nginx yourself, then run `preview-link doctor`.',
+                  file=sys.stderr)
+            return 1
+        print(f'  {show(reload_cmd)}: ok')
+    print('\nDone. Next: preview-link doctor')
+    return 0
+
+
+def rollback(layout, snap_file, snap_link, created):
+    for path, snap in ((layout.link, snap_link), (layout.file, snap_file)):
+        if path is not None:
+            try:
+                restore(path, snap)
+            except OSError as error:
+                print(f'warning: could not restore {path}: {error}', file=sys.stderr)
+    for directory in reversed(created):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def print_next(tls, host):
+    print('Next')
+    if tls == 'certbot':
+        print(f'  Point DNS for {host} at this server, then run this as root (preview-link does not run it):')
+        print(f'      certbot --nginx -d {host}')
+        print('  Links use https:// and work only after certbot has finished.')
+    elif tls == 'external':
+        print('  TLS ends outside this server (a CDN, tunnel or load balancer). It must forward the Host header')
+        print('  and send plain HTTP to the listen address above.')
+    else:
+        print('  The vhost serves plain HTTP. Links use http://.')
+    print('  Check the result with: preview-link doctor')
+
+
+# ---------------------------------------------------------------- undo
+
+def undo(args):
+    host = check_host(args.undo)
+    config = load_config()
+    mine = config.get('host') == host
+    filename = f'preview-link-{host}.conf'
+    candidates = []
+    if mine and config.get('vhost'):
+        link = Path(config['enabled_link']) if config.get('enabled_link') else None
+        candidates.append(SimpleNamespace(file=Path(config['vhost']), link=link))
+    binary = args.nginx_bin or (config.get('nginx_bin') if mine else None) or find_exe('nginx')
+    dirs = []
+    if args.nginx_conf_dir:
+        dirs = [Path(os.path.abspath(args.nginx_conf_dir))]
+    elif not candidates:
+        if not binary:
+            raise SystemExit('cannot locate the vhost: no config for this host and nginx was not found. '
+                             'Pass --nginx-conf-dir DIR.')
+        info = inspect_nginx(binary)
+        if info.error:
+            raise SystemExit(info.error)
+        prefix = Path(info.config.prefix)
+        dirs = [prefix / 'sites-enabled', prefix / 'conf.d', prefix / 'servers']
+    candidates += [layout_for_dir(d, filename) for d in dirs]
+    found, seen = [], set()
+    for item in candidates:
+        key = (str(item.file), str(item.link))
+        if key not in seen and (os.path.lexists(item.file) or (item.link and os.path.lexists(item.link))):
+            seen.add(key)
+            found.append(item)
+    print(f'preview-link init --undo {host}: {"APPLY" if args.apply else "DRY RUN (nothing is changed; add --apply to remove)"}')
+    if not found:
+        print(f'nothing to undo: no {filename} found.', file=sys.stderr)
+        return 1
+    removals = []
+    for item in found:
+        if os.path.lexists(item.file):
+            if not (item.file.is_file() and is_marked(item.file.read_text(errors='replace'))):
+                print(f'refusing to remove {item.file}: it does not start with "{MARKER}".', file=sys.stderr)
+                return 1
+            removals.append(item.file)
+        if item.link and os.path.lexists(item.link):
+            if item.link.is_symlink() and os.readlink(item.link) in (str(item.file), os.path.relpath(item.file, item.link.parent)):
+                removals.append(item.link)
+            else:
+                print(f'warning: leaving {item.link}: it is not a symlink to {item.file}.')
+    for path in removals:
+        print(f'  remove {path}')
+    root = None
+    if args.purge:
+        root = args.root or (config.get('root') if mine else None)
+        if not root:
+            print('--purge needs --root DIR, or a config file for this host.', file=sys.stderr)
+            return 1
+        root = check_dir(root, '--root')
+        for folder in sorted(Path(root).glob('*')) if os.path.isdir(root) else []:
+            if folder.is_dir() and TOKEN.match(folder.name):
+                print(f'  purge {folder}')
+        print(f'  remove {root} if it is empty afterwards')
+    else:
+        print('  published files stay (use --purge to delete them)')
+    if mine:
+        print(f'  remove config file {config_path()}')
+    reload_cmd = pick_reload(binary, bool(args.nginx_bin)) if binary else None
+    if reload_cmd and not args.no_reload:
+        print(f'  then {show([binary, "-t"])} and {show(reload_cmd)}')
+    if not args.apply:
+        return 0
+    if os.geteuid() != 0:
+        blocked = [p for p in removals if not os.access(p.parent, os.W_OK | os.X_OK)]
+        if blocked:
+            print(f'step "remove {blocked[0]}" needs root. Re-run as root (preview-link never calls sudo). '
+                  'Nothing was changed.', file=sys.stderr)
+            return 1
+    for path in removals:
+        path.unlink()
+    print('Removed the vhost.')
+    if root:
+        for folder in sorted(Path(root).glob('*')) if os.path.isdir(root) else []:
+            if folder.is_dir() and TOKEN.match(folder.name):
+                shutil.rmtree(folder)
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+    if mine:
+        try:
+            config_path().unlink()
+        except OSError:
+            pass
+    log({'action': 'undo', 'host': host, 'removed': [str(p) for p in removals], 'purge': bool(args.purge)})
+    if binary and not args.no_reload:
+        tested = run([binary, '-t'])
+        if tested.rc != 0:
+            print(f'{show([binary, "-t"])} failed, so nginx was not reloaded: {text_of(tested)}', file=sys.stderr)
+            return 1
+        reloaded = run(reload_cmd)
+        if reloaded.rc != 0:
+            print(f'{show(reload_cmd)} failed: {text_of(reloaded)}', file=sys.stderr)
+            return 1
+        print(f'{show(reload_cmd)}: ok')
+    elif not binary:
+        print('nginx was not found, so it was not reloaded.')
+    return 0
+
+
+# ---------------------------------------------------------------- doctor
+
+def doctor(_args):
+    config = load_config()
+    failures = []
+
+    def report(ok, name, detail=''):
+        print(f'{"ok  " if ok else "FAIL"}  {name}' + (f': {detail}' if detail else ''))
+        if not ok:
+            failures.append(name)
+
+    binary = config.get('nginx_bin') or find_exe('nginx')
+    if binary and os.access(binary, os.X_OK):
+        found = re.search(r'nginx/([^\s)]+)', text_of(run([binary, '-v'])))
+        report(True, 'nginx binary', f'{binary} {found.group(1) if found else ""}'.strip())
+    else:
+        report(False, 'nginx binary', 'not found; install nginx and run `preview-link init`')
+        binary = None
+
+    vhost = config.get('vhost')
+    if not vhost:
+        report(False, 'vhost file', f'no vhost in {config_path()}; run `preview-link init`')
+    elif not os.path.isfile(vhost):
+        report(False, 'vhost file', f'{vhost} is missing')
+    elif not is_marked(Path(vhost).read_text(errors='replace')):
+        report(False, 'vhost file', f'{vhost} has no "{MARKER}" line')
+    else:
+        link = config.get('enabled_link')
+        if link and not os.path.exists(link):
+            report(False, 'vhost file', f'symlink {link} is missing or broken')
+        else:
+            report(True, 'vhost file', vhost)
+
+    if binary:
+        tested = run([binary, '-t'])
+        report(tested.rc == 0, 'nginx -t', '' if tested.rc == 0 else text_of(tested).splitlines()[-1])
+
+    root = Path(os.environ.get('PREVIEW_LINK_ROOT') or config.get('root') or '')
+    root_ok = bool(str(root)) and root.is_dir() and os.access(root, os.W_OK | os.X_OK)
+    report(root_ok, 'root writable', str(root) if root_ok else f'{root or "no root configured"} is missing or not writable by uid {os.geteuid()}')
+
+    host, listen = config.get('host'), config.get('listen')
+    if not host or not listen:
+        report(False, 'round trip', 'needs host and listen from the config file; run `preview-link init`')
+    elif root_ok:
+        addr, port = parse_listen(listen)
+        round_trip(root, host, addr if addr and addr != '0.0.0.0' else '127.0.0.1', port, report)
+    else:
+        report(False, 'round trip', 'skipped: the root is not writable')
+
+    if failures:
+        print(f'{len(failures)} check(s) failed.')
+        return 1
+    print('All checks passed.')
+    return 0
+
+
+def round_trip(root, host, connect_host, port, report):
+    token = secrets.token_hex(10)
+    nonce = secrets.token_hex(8)
+    body = f'<!doctype html><title>preview-link probe</title><p>{nonce}</p>\n'.encode()
+    folder = root / token
+    where = f'{connect_host}:{port} as Host {host}'
+
+    def get(path, method='GET'):
+        return raw_request(connect_host, port, host, method, path)
+
+    try:
+        folder.mkdir()
+        folder.chmod(0o755)
+        for name, content in (('probe.html', body), ('.hidden', b'secret')):
+            (folder / name).write_bytes(content)
+            (folder / name).chmod(0o644)
+        try:
+            status, headers, got = get(f'/{token}/probe.html')
+        except OSError as error:
+            report(False, 'round trip', f'cannot connect to {where}: {error}')
+            return
+        report(status == 200 and got == body, 'GET probe file', f'status {status}, {len(got)} bytes, via {where}')
+        kind = headers.get('content-type', '')
+        report(kind.startswith('text/html'), 'content type', kind or 'missing')
+        for name, want in RESPONSE_HEADERS:
+            value = headers.get(name.lower(), '')
+            report(want in value, f'header {name}', value or 'missing')
+        status = get(f'/{token}/')[0]
+        report(status in (403, 404), 'token directory not listable', f'status {status}')
+        status = get('/')[0]
+        report(status in (403, 404), 'root not listable', f'status {status}')
+        status, _, got = get(f'/{token}/.hidden')
+        report(status in (403, 404) and b'secret' not in got, 'dotfile denied', f'status {status}')
+        status, _, got = get('/robots.txt')
+        report(status == 200 and b'Disallow: /' in got, 'robots.txt disallows all', f'status {status}')
+        status = get(f'/{token}/probe.html', 'POST')[0]
+        report(status == 405, 'POST refused', f'status {status}')
+    except OSError as error:
+        report(False, 'round trip', str(error))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    try:
+        status = get(f'/{token}/probe.html')[0]
+        report(status == 404, 'deleted file returns 404', f'status {status}')
+    except OSError as error:
+        report(False, 'deleted file returns 404', str(error))
+
+
+# ---------------------------------------------------------------- command line
+
+def main():
+    parser = argparse.ArgumentParser(prog='preview-link', description=__doc__.split('\n\n')[0])
+    commands = parser.add_subparsers(dest='command', required=True)
+
+    p = commands.add_parser('init', help='set up or remove the nginx vhost (dry run unless --apply)')
+    p.add_argument('--host', help='server name of the vhost')
+    p.add_argument('--root', help=f'directory for published files (default {DEFAULT_ROOT})')
+    p.add_argument('--listen', default='80', help='PORT or ADDRESS:PORT (default 80)')
+    p.add_argument('--tls', choices=('none', 'external', 'certbot'), default='none')
+    p.add_argument('--base-url', help='prefix of the links put prints')
+    p.add_argument('--nginx-conf-dir', help='directory that nginx includes in its http block')
+    p.add_argument('--nginx-bin', help='path of the nginx binary')
+    p.add_argument('--install-nginx', action='store_true', help='install nginx with the system package manager (needs --apply and root)')
+    p.add_argument('--force', action='store_true', help='replace a vhost file that preview-link did not write')
+    p.add_argument('--no-reload', action='store_true', help='do not reload nginx')
+    p.add_argument('--apply', action='store_true', help='write; without it init only prints the plan')
+    p.add_argument('--undo', metavar='HOST', help='remove the vhost for HOST')
+    p.add_argument('--purge', action='store_true', help='with --undo: also delete published files')
+    p.set_defaults(run=init)
+
+    p = commands.add_parser('doctor', help='check nginx, the vhost and a real round trip')
+    p.set_defaults(run=doctor)
+    p = commands.add_parser('put', help='publish a file and print its link')
+    p.add_argument('file')
+    p.add_argument('--name')
+    p.add_argument('--over')
+    p.set_defaults(run=put)
+    p = commands.add_parser('check', help='print status and content type of a link')
+    p.add_argument('link')
+    p.set_defaults(run=check)
+    p = commands.add_parser('rm', help='delete a preview and confirm 404')
+    p.add_argument('target')
+    p.add_argument('--no-check', action='store_true')
+    p.set_defaults(run=rm)
+    p = commands.add_parser('ls', help='list what is still public')
+    p.set_defaults(run=ls)
+
+    args = parser.parse_args()
+    sys.exit(args.run(args) or 0)
+
+
+if __name__ == '__main__':
+    main()
