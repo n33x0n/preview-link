@@ -13,10 +13,12 @@ import shutil
 import signal
 import socket
 import subprocess
+import runpy
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -81,6 +83,23 @@ def http_request(port, host, path, method='GET'):
     finally:
         conn.close()
 
+
+class ProbeSafetyTests(unittest.TestCase):
+    def test_existing_probe_directory_is_not_deleted(self):
+        module = runpy.run_path(str(SCRIPT))
+        token = 'a' * 20
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / token
+            folder.mkdir()
+            existing = folder / 'existing.html'
+            existing.write_text('keep')
+            results = []
+            with patch.object(module['secrets'], 'token_hex', return_value=token):
+                module['round_trip'](Path(tmp), 'preview.test', '127.0.0.1', 80,
+                                     lambda *args: results.append(args))
+            self.assertEqual(existing.read_text(), 'keep')
+            self.assertFalse(results[0][0])
+            self.assertIn('cannot create probe directory', results[0][2])
 
 # ------------------------------------------------------------------ stubs
 

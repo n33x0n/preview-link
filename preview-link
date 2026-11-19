@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Short-lived public files behind an unguessable URL, served by nginx.
+"""Public files behind a random URL, served by nginx.
 
   preview-link init --host HOST [--apply]   set up an nginx vhost (dry run unless --apply)
   preview-link init --undo HOST [--apply]   remove the vhost that init wrote
@@ -11,8 +11,8 @@
   preview-link ls                           list what is still public
 
 Files live in <root>/<token>/<name>. nginx serves them as <base-url>/<token>/<name> with
-Cache-Control: no-store. The token is random, so nothing is listed or guessable. The token is
-not authentication: anyone who has the link can read the file.
+Cache-Control: no-store. The token is random, but it is not authentication:
+anyone who has the link can read the file.
 """
 
 import argparse
@@ -1095,6 +1095,11 @@ def round_trip(root, host, connect_host, port, report):
 
     try:
         folder.mkdir()
+    except OSError as error:
+        report(False, 'round trip', f'cannot create probe directory {folder}: {error}')
+        return
+
+    try:
         folder.chmod(0o755)
         for name, content in (('probe.html', body), ('.hidden', b'secret')):
             (folder / name).write_bytes(content)

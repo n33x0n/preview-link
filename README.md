@@ -1,6 +1,6 @@
 # preview-link
 
-A small command-line tool and agent skill. It publishes a file at a public link that nobody can guess, checks the link as an outside client would, and deletes the file when the review is done. nginx serves the files. The tool can set up that nginx vhost on any server and for any host name you choose.
+A small command-line tool and agent skill. It publishes a file at a public link with a random token, checks the link as an outside client would, and deletes the file when the review is done. nginx serves the files. The tool can set up a vhost for a chosen host name on supported nginx layouts; see the tested environments and limits below.
 
 It is one Python 3 script with no dependencies beyond the standard library.
 
@@ -17,7 +17,7 @@ It is one Python 3 script with no dependencies beyond the standard library.
 - Every action goes to a JSON-lines log.
 - The vhost sends `Cache-Control: no-store, no-transform`, `X-Robots-Tag: noindex` and `X-Content-Type-Options: nosniff` on every response, serves only GET and HEAD, and lists no directory.
 
-The token is not authentication. Anyone who has the link can read the file.
+The token is not authentication. Anyone who has the link can read the file. Files do not expire automatically.
 
 ## Install
 
@@ -138,7 +138,7 @@ Use `--base-url` when the public address differs from what these modes assume.
 sh test/run.sh
 ```
 
-No root, no network, no change outside a temporary directory. 38 tests ran and passed on one host (Linux, Python 3.14, nginx 1.28.3 at `/usr/sbin/nginx`):
+No root, no network, no change outside a temporary directory. The tests include:
 
 - Detection and plan text, with fake `nginx`, `/etc/os-release`, `apt-get`, `dnf`, `yum`, `apk` and `systemctl` programs: package manager choice for apt, dnf, yum (through `ID_LIKE`), apk and an unknown system; Debian, `conf.d`, `servers`, relative-include and no-include layouts; an include outside the `http` block is not accepted; config read from disk when `nginx -T` fails; TLS modes; bad arguments; duplicate `server_name` warning.
 - `init --apply` against fake `nginx`: reload command choice (`nginx -s reload`, `systemctl reload nginx`, `--no-reload`), the Debian symlink, rollback that removes a new file or restores the old content, refusal to write where root is needed, refusal to overwrite without the marker, and `--force`.

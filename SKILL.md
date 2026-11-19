@@ -1,11 +1,11 @@
 ---
 name: preview-link
-description: Use when a task needs a file at a public link (a review copy of a page, a video, any short-lived preview), or when the nginx vhost that serves previews must be set up or checked. Publishes, checks and deletes files with preview-link.
+description: Use when a task needs a file at a public preview link, or when the nginx vhost that serves previews must be set up or checked. Publishes, checks and deletes files with preview-link.
 ---
 
 # preview-link
 
-Public, short-lived files behind an unguessable URL. nginx serves `<root>/<20-hex-token>/<file>`. The token is not authentication: anyone with the link can read the file.
+Public files behind a random URL. nginx serves `<root>/<20-hex-token>/<file>`. The token is not authentication: anyone with the link can read the file. Files do not expire automatically.
 
 ## Commands
 
